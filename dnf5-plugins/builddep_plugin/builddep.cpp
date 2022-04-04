@@ -111,7 +111,8 @@ void BuildDepCommand::parse_builddep_specs(int specs_count, const char * const s
 }
 
 
-bool BuildDepCommand::add_from_spec_file(std::set<std::string> & specs, const char * spec_file_name) {
+bool BuildDepCommand::add_from_spec_file(
+    std::set<std::string> & install_specs, std::set<std::string> & conflicts_specs, const char * spec_file_name) {
     auto spec = rpmSpecParse(spec_file_name, RPMSPEC_ANYARCH | RPMSPEC_FORCE, nullptr);
     if (spec == nullptr) {
         std::cerr << "Failed to parse spec file \"" << spec_file_name << "\"." << std::endl;
@@ -119,15 +120,21 @@ bool BuildDepCommand::add_from_spec_file(std::set<std::string> & specs, const ch
     }
     auto dependency_set = rpmdsInit(rpmSpecDS(spec, RPMTAG_REQUIRENAME));
     while (rpmdsNext(dependency_set) >= 0) {
-        specs.emplace(rpmdsDNEVR(dependency_set) + 2);
+        install_specs.emplace(rpmdsDNEVR(dependency_set) + 2);
     }
     rpmdsFree(dependency_set);
+    auto conflicts_set = rpmdsInit(rpmSpecDS(spec, RPMTAG_CONFLICTNAME));
+    while (rpmdsNext(conflicts_set) >= 0) {
+        conflicts_specs.emplace(rpmdsDNEVR(conflicts_set) + 2);
+    }
+    rpmdsFree(conflicts_set);
     rpmSpecFree(spec);
     return true;
 }
 
 
-bool BuildDepCommand::add_from_srpm_file(std::set<std::string> & specs, const char * srpm_file_name) {
+bool BuildDepCommand::add_from_srpm_file(
+    std::set<std::string> & install_specs, std::set<std::string> & conflicts_specs, const char * srpm_file_name) {
     auto fd = Fopen(srpm_file_name, "r");
     if (fd == NULL || Ferror(fd)) {
         std::cerr << "Failed to open \"" << srpm_file_name << "\": " << Fstrerror(fd) << std::endl;
@@ -151,10 +158,15 @@ bool BuildDepCommand::add_from_srpm_file(std::set<std::string> & specs, const ch
         while (rpmdsNext(dependency_set) >= 0) {
             std::string_view reldep = rpmdsDNEVR(dependency_set) + 2;
             if (!reldep.starts_with("rpmlib(")) {
-                specs.emplace(reldep);
+                install_specs.emplace(reldep);
             }
         }
         rpmdsFree(dependency_set);
+        auto conflicts_set = rpmdsInit(rpmdsNewPool(nullptr, header, RPMTAG_CONFLICTNAME, 0));
+        while (rpmdsNext(conflicts_set) >= 0) {
+            conflicts_specs.emplace(rpmdsDNEVR(conflicts_set) + 2);
+        }
+        rpmdsFree(conflicts_set);
     } else {
         std::cerr << "Failed to read rpm file \"" << srpm_file_name << "\"." << std::endl;
     }
@@ -164,7 +176,8 @@ bool BuildDepCommand::add_from_srpm_file(std::set<std::string> & specs, const ch
 }
 
 
-bool BuildDepCommand::add_from_pkg(std::set<std::string> & specs, const std::string & pkg_spec) {
+bool BuildDepCommand::add_from_pkg(
+    std::set<std::string> & install_specs, std::set<std::string> & conflicts_specs, const std::string & pkg_spec) {
     auto & ctx = static_cast<Context &>(get_session());
 
     libdnf::rpm::PackageQuery pkg_query(ctx.base);
@@ -185,7 +198,10 @@ bool BuildDepCommand::add_from_pkg(std::set<std::string> & specs, const std::str
     } else {
         for (const auto & pkg : source_pkgs) {
             for (const auto & reldep : pkg.get_requires()) {
-                specs.emplace(reldep.to_string());
+                install_specs.emplace(reldep.to_string());
+            }
+            for (const auto & reldep : pkg.get_conflicts()) {
+                conflicts_specs.emplace(reldep.to_string());
             }
         }
         return true;
@@ -203,6 +219,7 @@ void BuildDepCommand::run() {
 
     // get build dependencies from various inputs
     std::set<std::string> install_specs{};
+    std::set<std::string> conflicts_specs{};
     bool parse_ok = true;
 
     if (spec_file_paths.size() > 0) {
@@ -211,7 +228,7 @@ void BuildDepCommand::run() {
         }
 
         for (const auto & spec : spec_file_paths) {
-            parse_ok &= add_from_spec_file(install_specs, spec.c_str());
+            parse_ok &= add_from_spec_file(install_specs, conflicts_specs, spec.c_str());
         }
 
         for (const auto & macro : rpm_macros) {
@@ -220,11 +237,11 @@ void BuildDepCommand::run() {
     }
 
     for (const auto & srpm : srpm_file_paths) {
-        parse_ok &= add_from_srpm_file(install_specs, srpm.c_str());
+        parse_ok &= add_from_srpm_file(install_specs, conflicts_specs, srpm.c_str());
     }
 
     for (const auto & pkg : pkg_specs) {
-        parse_ok &= add_from_pkg(install_specs, pkg);
+        parse_ok &= add_from_pkg(install_specs, conflicts_specs, pkg);
     }
 
     if (!parse_ok) {
@@ -243,7 +260,22 @@ void BuildDepCommand::run() {
         }
     }
 
-    auto transaction = goal.resolve(false);
+    if (conflicts_specs.size() > 0) {
+        // exclude available (not installed) conflicting packages
+        auto system_repo = ctx.base.get_repo_sack()->get_system_repo();
+        auto rpm_package_sack = ctx.base.get_rpm_package_sack();
+        libdnf::rpm::PackageQuery conflicts_query_available(ctx.base);
+        conflicts_query_available.filter_name({conflicts_specs.begin(), conflicts_specs.end()});
+        libdnf::rpm::PackageQuery conflicts_query_installed(conflicts_query_available);
+        conflicts_query_available.filter_repo_id({system_repo->get_id()}, libdnf::sack::QueryCmp::NEQ);
+        rpm_package_sack->add_user_excludes(conflicts_query_available);
+
+        // remove already installed conflicting packages
+        conflicts_query_installed.filter_repo_id({system_repo->get_id()});
+        goal.add_rpm_remove(conflicts_query_installed);
+    }
+
+    auto transaction = goal.resolve(true);
     auto skip_unavailable = skip_unavailable_option.get_value();
     auto transaction_problems = transaction.get_problems();
     if (transaction_problems != libdnf::GoalProblem::NO_PROBLEM) {
