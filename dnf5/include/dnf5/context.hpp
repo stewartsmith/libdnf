@@ -73,6 +73,9 @@ public:
     /// rpm transaction and runs it.
     void download_and_run(libdnf::base::Transaction & transaction);
 
+    /// Check GPG signatures of packages that are going to be installed
+    bool check_gpg_signatures(const libdnf::base::Transaction & transaction);
+
     /// Set to true to suppresses messages notifying about the current state or actions of dnf5.
     void set_quiet(bool quiet) { this->quiet = quiet; }
 

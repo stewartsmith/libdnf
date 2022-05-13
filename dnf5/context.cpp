@@ -25,10 +25,12 @@ along with libdnf.  If not, see <https://www.gnu.org/licenses/>.
 #include <fmt/format.h>
 #include <libdnf-cli/progressbar/multi_progress_bar.hpp>
 #include <libdnf-cli/tty.hpp>
+#include <libdnf/base/base.hpp>
 #include <libdnf/base/goal.hpp>
 #include <libdnf/repo/package_downloader.hpp>
 #include <libdnf/rpm/package_query.hpp>
 #include <libdnf/rpm/package_set.hpp>
+#include <libdnf/rpm/rpm_signature.hpp>
 
 #include <filesystem>
 #include <iostream>
@@ -645,8 +647,35 @@ std::chrono::time_point<std::chrono::steady_clock> RpmTransCB::prev_print_time =
 
 }  // namespace
 
+
+bool Context::check_gpg_signatures(const libdnf::base::Transaction & transaction) {
+    bool retval{true};
+    libdnf::rpm::RpmSignature rpm_signature(base);
+    for (const auto & trans_pkg : transaction.get_transaction_packages()) {
+        if (transaction_item_action_is_inbound(trans_pkg.get_action())) {
+            auto const & pkg = trans_pkg.get_package();
+            auto rc = rpm_signature.check_package_signature(pkg);
+            // TODO(mblaha): import missing GPG keys
+            if (rc != libdnf::rpm::RpmSignature::CheckResult::OK) {
+                std::cerr << "GPG check for package \"" << pkg.get_nevra() << "\" failed: " << static_cast<int>(rc)
+                          << std::endl;
+                retval = false;
+            }
+        }
+    }
+    return retval;
+}
+
+
 void Context::download_and_run(libdnf::base::Transaction & transaction) {
     download_packages(transaction, nullptr);
+
+    std::cout << std::endl << "Verifying GPG signatures" << std::endl;
+    if (!check_gpg_signatures(transaction)) {
+        throw "XXXX";
+    }
+    std::cout << "OKOK" << std::endl;
+    throw "YYY";
 
     std::cout << std::endl << "Running transaction" << std::endl;
 
